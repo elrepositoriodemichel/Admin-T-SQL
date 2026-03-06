@@ -446,6 +446,50 @@ backupset --> backupfilegroup
 
 `backupmediaset` es el contenedor físico (el fichero `.bak`). `backupset` es cada backup individual que puede haber dentro de ese contenedor. `backupmediafamily` describe los ficheros físicos del media set. `backupfile` y `backupfilegroup` detallan los ficheros de datos y filegroups incluidos en cada backup.
 
+```mermaid
+erDiagram
+
+backupmediaset {
+    int media_set_id PK
+    uniqueidentifier media_uuid
+    varchar name
+}
+
+backupmediafamily {
+    int media_family_id PK
+    int media_set_id FK
+    varchar physical_device_name
+    int device_type
+}
+
+backupset {
+    int backup_set_id PK
+    int media_set_id FK
+    varchar database_name
+    datetime backup_start_date
+    datetime backup_finish_date
+    char type
+}
+
+backupfile {
+    int backup_set_id FK
+    int file_number
+    varchar logical_name
+    varchar physical_name
+}
+
+backupfilegroup {
+    int backup_set_id FK
+    int filegroup_id
+    varchar filegroup_name
+}
+
+backupmediaset ||--o{ backupmediafamily : media_set_id
+backupmediaset ||--o{ backupset : media_set_id
+backupset ||--o{ backupfile : backup_set_id
+backupset ||--o{ backupfilegroup : backup_set_id
+```
+
 ---
 
 ### Último backup de cada tipo por base de datos
