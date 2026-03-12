@@ -434,17 +434,13 @@ Las tablas de `msdb` registran cada backup realizado y toda su metadata. Son la 
 
 ### Relación entre tablas
 
-```mermaid
-flowchart LR
-
-SQLServerBackup --> backupset
-backupset --> backupmediaset
-backupmediaset --> backupmediafamily
-backupset --> backupfile
-backupset --> backupfilegroup
-```
-
-`backupmediaset` es el contenedor físico (el fichero `.bak`). `backupset` es cada backup individual que puede haber dentro de ese contenedor. `backupmediafamily` describe los ficheros físicos del media set. `backupfile` y `backupfilegroup` detallan los ficheros de datos y filegroups incluidos en cada backup.
+| Tabla | Definición  | Nota |
+|---|---|---|
+| `backupset` | Registra **cada backup ejecutado** (FULL, DIFF, LOG, FILE, PARTIAL…) | 1 backup ejecutado = 1 fila. Contiene LSNs, fechas, tipo y `media_set_id`|
+| `backupmediaset` | Representa el **conjunto de medios** donde se almacena un backup | Un media set puede contener **varios backupset** si se reutiliza el archivo |
+| `backupmediafamily` | Registra **cada archivo físico** del backup (cada stripe) | 1 archivo físico = 1 fila. Relacionado por `media_set_id` |
+| `backupfile` | Registra **cada archivo lógico** de la base incluido en el backup | 1 fila por cada MDF/NDF/LDF existente en la base en el momento del backup |
+| `backupfilegroup` | Registra los **filegroups** incluidos en el backup | 1 fila por filegroup (PRIMARY, FGs adicionales) |
 
 ```mermaid
 erDiagram
@@ -499,54 +495,66 @@ El punto de partida para cualquier auditoría de backups — de un vistazo sabes
 ```sql
 SELECT
     bs.database_name,
-    MAX(CASE WHEN bs.type = 'D' THEN bs.backup_finish_date END)     AS last_full,
-    MAX(CASE WHEN bs.type = 'I' THEN bs.backup_finish_date END)     AS last_differential,
-    MAX(CASE WHEN bs.type = 'L' THEN bs.backup_finish_date END)     AS last_log,
+    MAX(CASE WHEN bs.type = 'D' THEN bs.backup_finish_date END) AS last_full,
+    MAX(CASE WHEN bs.type = 'I' THEN bs.backup_finish_date END) AS last_differential,    
+    MAX(CASE WHEN bs.type = 'F' THEN bs.backup_finish_date END) AS last_full_file_or_filegroup,
+    MAX(CASE WHEN bs.type = 'G' THEN bs.backup_finish_date END) AS last_differential_file_or_filegroup,    
+    MAX(CASE WHEN bs.type = 'P' THEN bs.backup_finish_date END) AS last_full_partial,
+    MAX(CASE WHEN bs.type = 'Q' THEN bs.backup_finish_date END) AS last_differential_partial,    
+    MAX(CASE WHEN bs.type = 'L' THEN bs.backup_finish_date END) AS last_log,
     -- Antigüedad en horas del último FULL
     DATEDIFF(HOUR,
-        MAX(CASE WHEN bs.type = 'D' THEN bs.backup_finish_date END),
-        GETDATE())                                                   AS hours_since_last_full
-FROM msdb.dbo.backupset bs
-GROUP BY bs.database_name
-ORDER BY bs.database_name;
+             MAX(CASE WHEN bs.type = 'D' THEN bs.backup_finish_date END),
+             GETDATE()) AS hours_since_last_full
+FROM 
+    msdb.dbo.backupset bs
+GROUP BY 
+    bs.database_name
+ORDER BY 
+    bs.database_name;
 ```
 
 ---
 
-### Bases de datos sin backup en las últimas 24 horas
+### Bases de datos sin full backup en los últimos 7 días
 
-Alerta inmediata para detectar bases de datos que han quedado fuera de la política de backups.
+Alerta inmediata para detectar bases de datos que han podido quedar fuera de la política de backups, podemos adaptarla para hacer lo mismos con nuestros diferenciasles y/o logs con los periodos que les corresponadan a cada caso.
 
 ```sql
 SELECT
-    d.name                                                          AS database_name,
+    d.name AS database_name,
     d.recovery_model_desc,
-    MAX(bs.backup_finish_date)                                      AS last_full_backup,
-    DATEDIFF(HOUR, MAX(bs.backup_finish_date), GETDATE())           AS hours_without_backup
-FROM sys.databases d
-LEFT JOIN msdb.dbo.backupset bs
-    ON d.name = bs.database_name
-    AND bs.type = 'D'
-WHERE d.database_id > 4                         -- Excluye BDs de sistema
-  AND d.state_desc = 'ONLINE'
-GROUP BY d.name, d.recovery_model_desc
-HAVING MAX(bs.backup_finish_date) IS NULL
-    OR MAX(bs.backup_finish_date) < DATEADD(HOUR, -24, GETDATE())
-ORDER BY hours_without_backup DESC;
+    MAX(bs.backup_finish_date) AS last_full_backup,
+    DATEDIFF(DAY, MAX(bs.backup_finish_date), GETDATE()) AS days_without_backup
+FROM 
+    sys.databases d
+        LEFT JOIN 
+    msdb.dbo.backupset bs ON d.name = bs.database_name AND bs.type = 'D'
+WHERE 
+    d.database_id > 4 -- Excluye BDs de sistema
+    AND d.state_desc = 'ONLINE'
+GROUP BY 
+    d.name, d.recovery_model_desc
+HAVING 
+    MAX(bs.backup_finish_date) IS NULL
+    OR MAX(bs.backup_finish_date) < DATEADD(DAY, -7, GETDATE())
+ORDER BY 
+    days_without_backup DESC;
 ```
 
 ---
 
 ### Historial detallado de backups con tamaño y compresión
 
-Permite evaluar el ratio de compresión real y detectar backups anómalamente grandes o pequeños.
+Permite evaluar la duración y el ratio de compresión real para cada tipo de backup, así como la existencia de chequeo de integridad y cifrado, identificando el origen de la petición. Este ejemplo evalua únicamente backups a disco, para Azure o cinta ajustar el parámetro del WHERE.
 
 ```sql
 SELECT TOP 100
     bs.database_name,
     bs.backup_start_date,
     bs.backup_finish_date,
-    DATEDIFF(SECOND, bs.backup_start_date, bs.backup_finish_date)   AS duration_seconds,
+    -- Adaptar la medida de tiempo según se adapate mejor a las circustancias
+    DATEDIFF(SECOND, bs.backup_start_date, bs.backup_finish_date) AS duration_seconds,
     CASE bs.type
         WHEN 'D' THEN 'Full'
         WHEN 'I' THEN 'Differential'
@@ -555,53 +563,30 @@ SELECT TOP 100
         WHEN 'G' THEN 'Differential File'
         WHEN 'P' THEN 'Partial'
         WHEN 'Q' THEN 'Differential Partial'
-    END                                                             AS backup_type,
+    END AS backup_type,
     bs.is_copy_only,
-    CAST(bs.backup_size         / 1024.0 / 1024 AS DECIMAL(10,2))  AS backup_size_mb,
-    CAST(bs.compressed_backup_size / 1024.0 / 1024 AS DECIMAL(10,2)) AS compressed_size_mb,
-    CAST(
-        100.0 - (bs.compressed_backup_size * 100.0 / NULLIF(bs.backup_size, 0))
-    AS DECIMAL(5,2))                                                AS compression_pct,
+    -- Adaptar la medida de tamaño según se adapate mejor a las circustancias
+    CAST(bs.backup_size / 1024.0 / 
+         1024 AS DECIMAL(10,2)) AS backup_size_mb,
+    CAST(bs.compressed_backup_size / 1024.0 / 
+         1024 AS DECIMAL(10,2)) AS compressed_size_mb,
+    CAST(100.0 - (bs.compressed_backup_size * 100.0 / 
+         NULLIF(bs.backup_size, 0)) AS DECIMAL(5,2)) AS compression_pct,
     bs.has_backup_checksums,
     bs.is_password_protected,
     bs.encryptor_type,
-    mf.physical_device_name                                        AS backup_file,
-    bs.name                                                         AS backup_set_name,
+    mf.physical_device_name AS backup_file,
+    bs.name AS backup_set_name,
     bs.server_name,
     bs.user_name
-FROM msdb.dbo.backupset bs
-JOIN msdb.dbo.backupmediafamily mf
-    ON bs.media_set_id = mf.media_set_id
-WHERE mf.device_type = 2                        -- 2 = Disco (7 = cinta, 9 = URL/Azure)
-ORDER BY bs.backup_finish_date DESC;
-```
-
----
-
-### Verificar si los backups se realizaron con CHECKSUM
-
-Los backups sin checksum no pueden detectar corrupción de páginas en el momento de la restauración.
-
-```sql
-SELECT
-    bs.database_name,
-    bs.backup_finish_date,
-    CASE bs.type
-        WHEN 'D' THEN 'Full'
-        WHEN 'I' THEN 'Differential'
-        WHEN 'L' THEN 'Log'
-    END                                                 AS backup_type,
-    bs.has_backup_checksums,
-    bs.is_password_protected,
-    bs.encryptor_type,
-    mf.physical_device_name                             AS backup_file
-FROM msdb.dbo.backupset bs
-JOIN msdb.dbo.backupmediafamily mf
-    ON bs.media_set_id = mf.media_set_id
-WHERE bs.backup_finish_date >= DATEADD(DAY, -30, GETDATE())
-  AND mf.device_type = 2
-ORDER BY bs.has_backup_checksums ASC,   -- Los que no tienen checksum primero
-         bs.backup_finish_date DESC;
+FROM 
+    msdb.dbo.backupset bs
+        INNER JOIN 
+    msdb.dbo.backupmediafamily mf ON bs.media_set_id = mf.media_set_id
+WHERE 
+    mf.device_type = 2 -- 2 = Disco (7 = cinta, 9 = URL/Azure)
+ORDER BY 
+    bs.backup_finish_date DESC;
 ```
 
 ---
@@ -611,66 +596,101 @@ ORDER BY bs.has_backup_checksums ASC,   -- Los que no tienen checksum primero
 Útil para backups parciales o de filegroup, y para verificar qué ficheros físicos componían la base de datos en el momento del backup.
 
 ```sql
-DECLARE @database NVARCHAR(128) = 'NombreBD';
+DECLARE @database NVARCHAR(128);
+
+SET @database = '<TuBaseDeDatos>';
 
 -- Ficheros de datos incluidos en el último FULL
 SELECT
+bs.backup_set_id,
     bs.backup_finish_date,
     bf.logical_name,
-    bf.physical_name                                    AS physical_name_at_backup_time,
-    CAST(bf.file_size    / 1024.0 / 1024 AS DECIMAL(10,2)) AS file_size_mb,
-    bfg.name                                            AS filegroup_name,
-    bfg.type_desc                                       AS filegroup_type
-FROM msdb.dbo.backupset bs
-JOIN msdb.dbo.backupfile bf
-    ON bs.backup_set_id = bf.backup_set_id
-LEFT JOIN msdb.dbo.backupfilegroup bfg
-    ON bs.backup_set_id = bfg.backup_set_id
-    AND bf.file_number  = bfg.filegroup_id
-WHERE bs.database_name = @database
-  AND bs.type          = 'D'
-  AND bs.backup_set_id = (
-        SELECT TOP 1 backup_set_id
-        FROM msdb.dbo.backupset
-        WHERE database_name = @database
-          AND type          = 'D'
-        ORDER BY backup_finish_date DESC
-  )
+    bf.physical_name AS physical_name_at_backup_time,
+    CAST(bf.file_size / 1024.0 / 1024 AS DECIMAL(10,2)) AS file_size_mb,
+    ISNULL(bfg.name, 'Not Applicable') AS filegroup_name,
+    ISNULL(bfg.type_desc, 'Not Applicable') AS filegroup_type
+FROM 
+    msdb.dbo.backupset bs
+        INNER JOIN 
+    msdb.dbo.backupfile bf ON bs.backup_set_id = bf.backup_set_id
+        LEFT JOIN 
+    msdb.dbo.backupfilegroup bfg ON bs.backup_set_id = bfg.backup_set_id
+                                AND bf.filegroup_guid  = bfg.filegroup_guid
+WHERE 
+    bs.database_name = @database
+    AND bs.type = 'D'
+    AND bs.backup_set_id = (
+                                SELECT TOP 1 
+                                    backup_set_id
+                                FROM 
+                                    msdb.dbo.backupset
+                                WHERE 
+                                    database_name = @database
+                                    AND type = 'D'
+                                ORDER BY backup_finish_date DESC
+                          )
 ORDER BY bf.logical_name;
 ```
 
 ---
 
-### Ocupación en disco por base de datos y mes
+### Planificación de espacio necesario para la retención de backups
 
-Ayuda a planificar la capacidad de almacenamiento necesaria para retener los backups.
+Ayuda a planificar la capacidad de almacenamiento necesaria para retener los backups. Esta SELECT dependerá básicamente de tu política de retenciones y tu planificación de backups. Supongamos un ejemplo donde hacemos un FULL los lunes a las 00:00, un DIFF de martes a domingo a la misma hora y los LOGs están planificados cada 15 minutos. Si el objetivo en poder hacer un PiTR (Point in Time Recovery) de cualquier parte del último mes, tendríamos que basarnos en la siguiente política de retenciones según el esquema de backups:
+
+|Tipo|Retención en disco|Propósito|
+|---|---|---|
+| Full(Lunes)|5 semanas | Tener siempre el mes completo cerrado + la semana en curso|
+| Diferenciales | 14 días | Te permite restaurar cualquier día de las últimas dos semanas de forma rápida |
+| Logs (10 minutos) | 30 días | Garantiza que puedes volver a cualquier momento del último mes |
+
+> ⚠️ **Esto corresponde con una Política de Retención Operativa (STR):** Orienta a una recuperación ante desastres y errores recientes, por lo que hay que tomar en cuenta también la **Política de Retención a Largo Plazo (LTR)** a menudo dictadas por normativas legales o reglas de negocio, aunque estas copias suelen almacenarse por separado en capas de almacenamiento más económicas.
 
 ```sql
-SELECT
-    bs.database_name,
-    YEAR(bs.backup_finish_date)                         AS year,
-    MONTH(bs.backup_finish_date)                        AS month,
-    CASE bs.type
-        WHEN 'D' THEN 'Full'
-        WHEN 'I' THEN 'Differential'
-        WHEN 'L' THEN 'Log'
-    END                                                 AS backup_type,
-    COUNT(*)                                            AS num_backups,
-    CAST(SUM(bs.compressed_backup_size) / 1024.0 / 1024 / 1024 AS DECIMAL(10,2)) AS total_gb
-FROM msdb.dbo.backupset bs
-JOIN msdb.dbo.backupmediafamily mf
-    ON bs.media_set_id = mf.media_set_id
-WHERE mf.device_type = 2
-GROUP BY
-    bs.database_name,
-    YEAR(bs.backup_finish_date),
-    MONTH(bs.backup_finish_date),
-    bs.type
-ORDER BY
-    bs.database_name,
-    year DESC,
-    month DESC,
-    bs.type;
+WITH DailyAggregates AS (
+    -- Obtenemos el tamaño diario consumido por cada tipo de backup
+    SELECT 
+        bs.database_name,
+        CAST(bs.backup_finish_date AS DATE) AS backup_date,
+        SUM(CASE WHEN bs.type = 'D' THEN bs.compressed_backup_size ELSE 0 END) / 1024.0 / 1024 / 1024 AS Full_Gb,
+        SUM(CASE WHEN bs.type = 'I' THEN bs.compressed_backup_size ELSE 0 END) / 1024.0 / 1024 / 1024 AS Diff_Gb,
+        SUM(CASE WHEN bs.type = 'L' THEN bs.compressed_backup_size ELSE 0 END) / 1024.0 / 1024 / 1024 AS Log_Gb
+    FROM 
+        msdb.dbo.backupset bs
+    WHERE 
+        bs.backup_finish_date > DATEADD(MONTH, -3, GETDATE()) -- Analizamos últimos 3 meses para tener buena media
+        AND bs.type IN ('D', 'I', 'L')
+    GROUP BY 
+        bs.database_name, CAST(bs.backup_finish_date AS DATE)
+),
+MediasPorBase AS (
+    -- Calculamos las medias y los máximos representativos
+    SELECT 
+        database_name,
+        AVG(NULLIF(Full_Gb, 0)) AS Avg_Single_Full_Gb,
+        MAX(Diff_Gb) AS Max_Daily_Diff_Gb,
+        AVG(NULLIF(Log_Gb, 0)) AS Avg_Daily_Log_Gb
+    FROM 
+        DailyAggregates
+    GROUP BY 
+        database_name
+)
+SELECT 
+    database_name,
+    CAST(Avg_Single_Full_GB AS DECIMAL(10,2)) AS avg_single_full_gb,
+    CAST(Avg_Single_Full_GB * 5 AS DECIMAL(10,2)) AS total_retention_full_gb,
+    CAST(Max_Daily_Diff_GB * 14 AS DECIMAL(10,2)) AS total_retention_diff_gb,
+    CAST(Avg_Daily_Log_GB * 30 AS DECIMAL(10,2)) AS total_retention_log_gb,
+    CAST((Avg_Single_Full_GB * 5) + 
+         (Max_Daily_Diff_GB * 14) + 
+         (Avg_Daily_Log_GB * 30) 
+         AS DECIMAL(10,2)) AS total_capacity_required_gb,
+    CAST(((Avg_Single_Full_GB * 5) + (Max_Daily_Diff_GB * 14) + (Avg_Daily_Log_GB * 30)) * 1.20 
+         AS DECIMAL(10,2)) AS projected_with_growth_buffer_gb
+FROM 
+    MediasPorBase
+ORDER BY 
+    total_capacity_required_gb DESC;
 ```
 
 ---
@@ -687,7 +707,7 @@ Antes de ejecutar cualquier backup a URL necesitas:
 2. Una **Shared Access Signature (SAS)** con permisos de lectura, escritura, lista y eliminación sobre el contenedor
 3. Una **credencial en SQL Server** que almacene esa SAS de forma segura
 
-### Paso 1 — Crear la SAS en Azure
+#### Paso 1 — Crear la SAS en Azure
 
 Desde Azure Portal navega a tu Storage Account → contenedor → `Shared access tokens` y genera una SAS con los siguientes permisos mínimos:
 
@@ -698,9 +718,10 @@ Desde Azure Portal navega a tu Storage Account → contenedor → `Shared access
 | **List** | Explorar el contenedor desde SSMS |
 | **Delete** | Limpiar backups expirados |
 
-También puedes generarla con Azure CLI:
+También puedes generarla con Azure CLI/PowerShell:
 
 ```bash
+# Generar un SAS con Azure CLI
 az storage container generate-sas \
     --account-name <storage_account_name> \
     --name <container_name> \
@@ -716,7 +737,7 @@ sv=2022-11-02&ss=b&srt=co&sp=rwdlacuptfx&se=2027-01-01T00:00:00Z&st=...&spr=http
 
 ---
 
-### Paso 2 — Crear la credencial en SQL Server
+#### Paso 2 — Crear la credencial en SQL Server
 
 La credencial se crea en `master` y asocia la URL base del contenedor con el token SAS. **El token SAS no debe incluir el `?` inicial.**
 
@@ -734,7 +755,7 @@ IF EXISTS (
 CREATE CREDENTIAL [https://<storage_account>.blob.core.windows.net/<container>]
 WITH
     IDENTITY = 'SHARED ACCESS SIGNATURE',
-    SECRET   = 'sv=2022-11-02&ss=b&srt=co&sp=rwdl&se=2027-01-01T...&sig=...';
+    SECRET = 'sv=2022-11-02&ss=b&srt=co&sp=rwdl&se=2027-01-01T...&sig=...';
     -- ⚠️ El SECRET es el token SAS sin el '?' inicial
 ```
 
@@ -748,7 +769,7 @@ WHERE name LIKE 'https://%blob.core.windows.net%';
 
 ---
 
-### Paso 3 — Backup a URL
+#### Paso 3 — Backup a URL
 
 Con la credencial creada, la sintaxis es idéntica a un backup a disco sustituyendo `TO DISK` por `TO URL`:
 
@@ -757,28 +778,28 @@ Con la credencial creada, la sintaxis es idéntica a un backup a disco sustituye
 BACKUP DATABASE [NombreBD]
 TO URL = 'https://<storage_account>.blob.core.windows.net/<container>/NombreBD_Full.bak'
 WITH FORMAT,
-    NAME          = 'NombreBD-Full Backup',
+    NAME = 'NombreBD-Full Backup',
     COMPRESSION,
     CHECKSUM,
-    STATS         = 10;
+    STATS = 10;
 
 -- Backup diferencial
 BACKUP DATABASE [NombreBD]
 TO URL = 'https://<storage_account>.blob.core.windows.net/<container>/NombreBD_Diff.bak'
 WITH DIFFERENTIAL,
-    NAME          = 'NombreBD-Differential Backup',
+    NAME = 'NombreBD-Differential Backup',
     COMPRESSION,
     CHECKSUM,
-    STATS         = 10;
+    STATS = 10;
 
 -- Backup de log de transacciones
 BACKUP LOG [NombreBD]
 TO URL = 'https://<storage_account>.blob.core.windows.net/<container>/NombreBD_Log_20260223_0800.trn'
 WITH
-    NAME          = 'NombreBD-Log Backup',
+    NAME = 'NombreBD-Log Backup',
     COMPRESSION,
     CHECKSUM,
-    STATS         = 10;
+    STATS = 10;
 ```
 
 ---
@@ -790,18 +811,18 @@ Para backups programados mediante un job es conveniente incluir la fecha en el n
 ```sql
 DECLARE @url NVARCHAR(500) =
     'https://<storage_account>.blob.core.windows.net/<container>/NombreBD_Full_'
-    + CONVERT(VARCHAR, GETDATE(), 112)              -- YYYYMMDD
+    + CONVERT(VARCHAR, GETDATE(), 112) -- YYYYMMDD
     + '_'
-    + REPLACE(CONVERT(VARCHAR(5), GETDATE(), 108), ':', '')  -- HHMM
+    + REPLACE(CONVERT(VARCHAR(5), GETDATE(), 108), ':', '') -- HHMM
     + '.bak';
 
 BACKUP DATABASE [NombreBD]
 TO URL = @url
 WITH FORMAT,
-    NAME       = 'NombreBD-Full Backup',
+    NAME = 'NombreBD-Full Backup',
     COMPRESSION,
     CHECKSUM,
-    STATS      = 10;
+    STATS = 10;
 ```
 
 ---
@@ -818,10 +839,10 @@ TO
     URL = 'https://<storage_account>.blob.core.windows.net/<container>/AW2022_stripe_3.bak'
 WITH FORMAT,
     CREDENTIAL = 'https://<storage_account>.blob.core.windows.net/<container>',
-    NAME       = 'NombreBD-Striped Backup',
+    NAME = 'NombreBD-Striped Backup',
     COMPRESSION,
     CHECKSUM,
-    STATS      = 10;
+    STATS = 10;
 ```
 
 >  ⚠️  Para restaurar un backup en stripe hay que especificar **todos los blobs** en el mismo orden en que se crearon. El límite técnico de archivos en un Backup Stripe de SQL Server es de 64 dispositivos.
@@ -840,29 +861,24 @@ SELECT
         WHEN 'D' THEN 'Full'
         WHEN 'I' THEN 'Differential'
         WHEN 'L' THEN 'Log'
-    END                                                         AS backup_type,
+        WHEN 'F' THEN 'File/Filegroup'
+        WHEN 'G' THEN 'Differential File'
+        WHEN 'P' THEN 'Partial'
+        WHEN 'Q' THEN 'Differential Partial'
+    END AS backup_type,
     CAST(bs.compressed_backup_size / 1024.0 / 1024 AS DECIMAL(10,2)) AS compressed_mb,
     bs.has_backup_checksums,
     bs.encryptor_type,
-    mf.physical_device_name                                     AS blob_url
-FROM msdb.dbo.backupset bs
-JOIN msdb.dbo.backupmediafamily mf
-    ON bs.media_set_id = mf.media_set_id
-WHERE mf.device_type = 9                    -- 9 = URL (Azure Blob Storage)
-ORDER BY bs.backup_finish_date DESC;
+    mf.physical_device_name AS blob_url
+FROM 
+    msdb.dbo.backupset bs
+        INNER JOIN 
+    msdb.dbo.backupmediafamily mf ON bs.media_set_id = mf.media_set_id
+WHERE 
+    mf.device_type = 9 -- 9 = URL (Azure Blob Storage)
+ORDER BY 
+    bs.backup_finish_date DESC;
 ```
-
----
-
-### Diferencias clave entre backup a disco y a URL
-
-| Aspecto | Disco (`TO DISK`) | Azure Blob Storage (`TO URL`) |
-|---|---|---|
-| Tamaño máximo por fichero | Sin límite práctico | 200 GB por blob (usar stripe para más) |
-| Credencial requerida | No | Sí — SAS en `sys.credentials` |
-| `device_type` en msdb | `2` | `9` |
-| Acceso desde SSMS Restore | ✅ | ✅ (requiere credencial) |
-| Coste de almacenamiento | Infraestructura propia | Por GB/mes según tier de Azure |
 
 ---
 
@@ -872,14 +888,14 @@ ORDER BY bs.backup_finish_date DESC;
 
 ### Instalación
 
-Descarga el script desde [ola.hallengren.com](https://ola.hallengren.com/sql-server-backup.html) y ejecútalo sobre la base de datos donde quieras centralizar el mantenimiento (habitualmente una BD de administración propia o `master`). Crea los procedimientos `DatabaseBackup`, `DatabaseIntegrityCheck` e `IndexOptimize`, además de la tabla `CommandLog` donde queda registro de cada ejecución.
+Descarga el script desde [ola.hallengren.com](https://ola.hallengren.com/sql-server-backup.html) y ejecútalo sobre la base de datos donde quieras centralizar el mantenimiento (habitualmente una BD de administración propia o `master`). Este script crea entre otros los procedimientos `DatabaseBackup`, `DatabaseIntegrityCheck` e `IndexOptimize`, además de la tabla `CommandLog` donde queda registro de cada ejecución, incluyendo también los JOBs base a los que unicamente tendríamos que añadir cuando han de ejecutarse y ajustar la parametrización según corresponda.
 
 ### Ejemplos de uso
 ```sql
 -- FULL de todas las bases de datos de usuario con compresión y checksum
 EXEC dbo.DatabaseBackup
     @Databases              = 'USER_DATABASES',
-    @Directory              = 'H:\DATA\Backups',
+    @Directory              = 'H:\DATA',
     @BackupType             = 'FULL',
     @Compress               = 'Y',
     @Checksum               = 'Y',
@@ -891,7 +907,7 @@ EXEC dbo.DatabaseBackup
 -- Ola detecta automáticamente cuáles admiten backup de log
 EXEC dbo.DatabaseBackup
     @Databases              = 'USER_DATABASES',
-    @Directory              = 'H:\DATA\Backups',
+    @Directory              = 'H:\DATA',
     @BackupType             = 'LOG',
     @Compress               = 'Y',
     @Checksum               = 'Y',
@@ -900,9 +916,8 @@ EXEC dbo.DatabaseBackup
 
 -- FULL excluyendo bases de datos concretas
 EXEC dbo.DatabaseBackup
-    @Databases              = 'USER_DATABASES',
-    @Exclude                = 'BaseDeDatosTemporal, BaseDePruebas',
-    @Directory              = 'H:\DATA\Backups',
+    @Databases              = 'USER_DATABASES, -BaseDeDatosTemporal, -BaseDePruebas',
+    @Directory              = 'H:\DATA',
     @BackupType             = 'FULL',
     @Compress               = 'Y',
     @Checksum               = 'Y',
@@ -913,11 +928,12 @@ EXEC dbo.DatabaseBackup
 EXEC dbo.DatabaseBackup
     @Databases              = 'USER_DATABASES',
     @URL                    = 'https://<storage_account>.blob.core.windows.net/<container>',
-    @Credential             = 'https://<storage_account>.blob.core.windows.net/<container>',
     @BackupType             = 'FULL',
     @Compress               = 'Y',
-    @Checksum               = 'Y',
-    @LogToTable             = 'Y';
+    @Verify                 = 'Y',
+    @NumberOfFiles          = 8,
+    @MaxTransferSize        = 4194304,
+    @BlockSize              = 65536
 ```
 
 ### Consultar el log de ejecuciones
