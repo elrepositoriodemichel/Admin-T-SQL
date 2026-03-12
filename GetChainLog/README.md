@@ -33,7 +33,7 @@ DECLARE @target_datetime DATETIME = '2025-11-07 14:03:12';
 -- Validaciones
 IF DB_ID(@database) IS NULL
 BEGIN
-    RAISERROR('Nombre de base de datos inválido', 16, 1);
+    RAISERROR('La base de datos especificada no existe o el nombre es inválido', 16, 1);
     RETURN;
 END;
 
@@ -112,7 +112,7 @@ diff_backup AS (
     ORDER BY 
         bs.backup_finish_date DESC
 ),
--- LSN de inicio de la cadena de logs: last_lsn del DIFF si existe, si no del FULL
+-- LSN de inicio: checkpoint_lsn del DIFF, o last_lsn del FULL si no hay DIFF
 start_lsn AS (
     SELECT COALESCE(
         (SELECT checkpoint_lsn FROM diff_backup), 
@@ -144,7 +144,7 @@ log_chain AS (
         bs.database_name = @database
         AND bs.type = 'L'
         AND bs.first_lsn <= sl.lsn
-        AND bs.last_lsn > sl.lsn  
+        AND bs.last_lsn > sl.lsn
 
     UNION ALL
 
@@ -289,7 +289,7 @@ CROSS APPLY
         ) mf
 ```
 
-> ⚠️ `STRING_AGG` requiere **SQL Server 2017 o superior**. En versiones anteriores debe sustituirse por `FOR XML PATH`:
+> ⚠️ `STRING_AGG` requiere **SQL Server 2017 (14.x) o superior**. En versiones anteriores debe sustituirse por `FOR XML PATH`:
 > ```sql
 > CROSS APPLY 
 >    (  SELECT STUFF(
@@ -348,7 +348,7 @@ RESTORE LOG [<TuBaseDeDatos>]
 
 > ⚠️ Todos los pasos intermedios deben usar `NORECOVERY`. Solo el último `RESTORE LOG` usa `RECOVERY` con `STOPAT`. Si se aplica `RECOVERY` antes del último paso la base de datos queda en línea en ese punto y no se pueden aplicar más backups.
 
-> ⚠️ La información de ficheros lógicos de cada backup está en msdb.dbo.backupfile. Podemos aprovecharnos del backup_set_id que ya tenemos en full_backup para obtener los nombres lógicos y sugerir rutas alternativas que no colisionen con los ficheros existentes a través del siguiente script:
+> 💡 **Tip:** La información de ficheros lógicos de cada backup está en msdb.dbo.backupfile. Podemos aprovecharnos del backup_set_id que ya tenemos en full_backup para obtener los nombres lógicos y sugerir rutas alternativas que no colisionen con los ficheros existentes a través del siguiente script:
 ```sql
 -- Sustituir @full_backup_set_id por el Id del FULL devuelto
 DECLARE @full_backup_set_id INT = <backup_set_id>;
@@ -402,8 +402,8 @@ ORDER BY
 | `First LSN` | Primer Log Sequence Number (LSN) cubierto por este backup |
 | `Last LSN` | Último LSN cubierto por este backup |
 | `Checkpoint LSN` | LSN del último checkpoint activo en el momento del backup |
-| `Backup Size (Mb)` | Tamaño sin comprimir del backup |
-| `Compressed Size (Mb)` | Tamaño comprimido real en disco |
+| `Backup Size (MB)` | Tamaño sin comprimir del backup |
+| `Compressed Size (MB)` | Tamaño comprimido real en disco |
 | `Has Checksum` | Indica si el backup se realizó con `CHECKSUM` |
 | `Files` | Ruta física del fichero de backup a usar en el `RESTORE` |
 
@@ -427,7 +427,7 @@ ORDER BY
 | `9` | URL — Azure Blob Storage |
 | `105` | Permanent backup device (`sp_addumpdevice`) |
 
-El filtro `device_type IN (2, 9)` se centra en los dispositivos más habituales. Ajustar si se requiere.
+El filtro `device_type IN (2, 9)` incluye discos locales/UNC y Azure Blob Storage.. Ajustar si se requiere.
 
 ---
 
@@ -452,4 +452,8 @@ Get-DbaBackupInformation -SqlInstance SRV-2K22-DB01 `
 
 Esta función escanea los archivos de copia de seguridad y lee sus encabezados para crear objetos estructurados de historial de backups que se utilizan en operaciones de restauración. Puede además encadenarse directamente con `Restore-DbaDatabase` para ejecutar la restauración completa en un único pipeline de PowerShell, generando y ejecutando las instrucciones `RESTORE` en el orden correcto y con el `STOPAT` adecuado.
 
-Nuestro script opera en T-SQL puro, sin dependencias externas y directamente desde cualquier cliente SQL — SSMS, Azure Data Studio o cualquier aplicación con acceso a la instancia. Esto lo hace especialmente útil en entornos donde PowerShell está restringido, donde no es posible instalar módulos externos, o simplemente cuando se necesita una validación rápida de la cadena disponible antes de iniciar un proceso de restauración.
+Este script opera en T-SQL puro, sin dependencias externas y directamente desde cualquier cliente SQL — SSMS, Azure Data Studio o cualquier aplicación con acceso a la instancia. Esto lo hace especialmente útil en entornos donde PowerShell está restringido, donde no es posible instalar módulos externos, o simplemente cuando se necesita una validación rápida de la cadena disponible antes de iniciar un proceso de restauración.
+
+### Changelog / Versiones
+
+- **v1.0** (2025-03-12): Versión inicial con soporte para backup chains complejos, filegroups, y striped backups.

@@ -43,7 +43,7 @@ Guía de referencia que empareja las opciones de backup disponibles en el asiste
 |---|---|---|
 | ***Back up to: Disk*** | `TO DISK = 'ruta\fichero.bak'` | Opción habitual |
 | ***Back up to: URL*** | `TO URL = 'https://...'` | Para Azure Blob Storage |
-| **Múltiples destinos** | `TO DISK = '...', DISK = '...']` o `TO URL = '...', URL = '...']` | El backup se distribuye entre varios ficheros para mejorar el rendimiento |
+| **Múltiples destinos** | `TO DISK = '...', DISK = '...'` o `TO URL = '...', URL = '...'` | El backup se distribuye entre varios ficheros para mejorar el rendimiento |
 
 ```sql
 -- Backup FULL a disco
@@ -107,7 +107,9 @@ Esta sección controla qué ocurre con el fichero `.bak` o `.trn` si ya existe o
 | ***Perform checksum before writing to media*** | `WITH CHECKSUM` | Calcula y almacena un checksum de cada página antes de escribirla. Permite detectar corrupción tanto en la escritura como en futuras restauraciones. **Muy recomendado.** |
 | ***Continue on error*** | `WITH CONTINUE_AFTER_ERROR` | Continúa el backup aunque encuentre páginas con errores. Solo útil en situaciones de recuperación de emergencia, **no usar en backups de producción rutinarios.** |
 ```sql
--- La comprobación al final del backup se realiza con RESTORE VERIFYONLY a la finalización del backup
+-- ⚠️ RESTORE VERIFYONLY Verifica que el backup set está completo, los volúmenes son legibles,
+-- algunos campos de cabecera de página (como el Page ID) y el checksum si existe.
+-- NO verifica la estructura interna de los datos ni garantiza recuperabilidad total.
 DECLARE @backupSetId AS INT
 
 SELECT 
@@ -206,13 +208,12 @@ BACKUP LOG [NombreBD]
 | ***Compress backup*** | `WITH COMPRESSION` | Disponible desde SQL Server 2008 en ediciones **Enterprise y Standard (2008 R2)** |
 | ***Do not compress backup*** | `WITH NO_COMPRESSION` | Fuerza sin compresión aunque el servidor tenga la compresión habilitada por defecto |
 
-> 💡 La compresión reduce el tamaño del fichero entre un 50-70% en la mayoría de los casos a cambio de mayor uso de CPU. En servidores con CPU disponible, **siempre merece la pena activarla**.
+> 💡 La compresión reduce el tamaño del fichero entre un 60-80% en la mayoría de los casos a cambio de mayor uso de CPU. En servidores con CPU disponible, **siempre merece la pena activarla**.
 
-> ⚠️ Cuando TDE está activo, la compresión de backup opera sobre páginas ya cifradas, lo que hace que el ratio de compresión sea escaso en la mayoría de los casos.
->Las implicaciones prácticas son:
->- El uso de CPU para compresión se mantiene igual — SQL Server sigue intentando comprimir aunque no consiga reducción
->- Se consume CPU sin beneficio real en tamaño
->- En VLDBs con TDE activar compresión de backup es esencialmente desperdiciar CPU
+> ⚠️ Con TDE activo, la compresión opera sobre datos ya cifrados, resultando en 
+> ratios de compresión significativamente inferiores (típicamente 10-30% vs 60-80%).
+> SQL Server 2016+ incluye optimizaciones, pero el overhead de CPU persiste.
+> Considerar `NO_COMPRESSION` explícito si la CPU es un cuello de botella.
 
 ### Cifrado
 
@@ -323,7 +324,7 @@ BACKUP LOG [NombreBD]
         STATS = 10;
 ```
 
-> 💡 **Sobre la estructura de carpetas:** separar FULL, DIFF y LOG en subcarpetas distintas facilita enormemente la gestión de retención y la localización de ficheros durante una restauración. Una política de retención habitual para esta estrategia sería mantener **4 semanas** de FULLs, **48 horas** de DIFFs y **24 horas** de LOGs, ajustando según el espacio disponible y los requisitos de RPO/RTO del negocio.
+> 💡 **Sobre la estructura de carpetas:** separar FULL, DIFF y LOG en subcarpetas distintas facilita enormemente la gestión de retención y la localización de ficheros durante una restauración. Una política de retención habitual para esta estrategia sería mantener **5 semanas** de FULLs, **48 horas** de DIFFs y **24 horas** de LOGs, ajustando según el espacio disponible y los requisitos de RPO/RTO del negocio.
 
 > ⚠️ **Con TDE activo:** la opción `COMPRESSION` genera overhead de CPU sin beneficio real en reducción de tamaño al operar sobre páginas ya cifradas. Valorar sustituirla por `NO_COMPRESSION` explícito en ese escenario, sí a nivel de instancia tenemos configurado que se comprima por defecto.
 
@@ -640,7 +641,7 @@ Ayuda a planificar la capacidad de almacenamiento necesaria para retener los bac
 
 |Tipo|Retención en disco|Propósito|
 |---|---|---|
-| Full(Lunes)|5 semanas | Tener siempre el mes completo cerrado + la semana en curso|
+| Full(Lunes)|4 semanas | Tener siempre el mes completo cerrado + la semana en curso|
 | Diferenciales | 14 días | Te permite restaurar cualquier día de las últimas dos semanas de forma rápida |
 | Logs (10 minutos) | 30 días | Garantiza que puedes volver a cualquier momento del último mes |
 
@@ -652,24 +653,33 @@ WITH DailyAggregates AS (
     SELECT 
         bs.database_name,
         CAST(bs.backup_finish_date AS DATE) AS backup_date,
-        SUM(CASE WHEN bs.type = 'D' THEN bs.compressed_backup_size ELSE 0 END) / 1024.0 / 1024 / 1024 AS Full_Gb,
-        SUM(CASE WHEN bs.type = 'I' THEN bs.compressed_backup_size ELSE 0 END) / 1024.0 / 1024 / 1024 AS Diff_Gb,
-        SUM(CASE WHEN bs.type = 'L' THEN bs.compressed_backup_size ELSE 0 END) / 1024.0 / 1024 / 1024 AS Log_Gb
+        -- FULL: máximo del día (NULL si no hay FULL ese día)
+        NULLIF(MAX(CASE WHEN bs.type = 'D' THEN bs.compressed_backup_size END), 0) / 1024.0 / 1024 / 1024 AS Full_Gb,
+        -- DIFF: suma total del día (NULL si no hay DIFF)
+        NULLIF(SUM(CASE WHEN bs.type = 'I' THEN bs.compressed_backup_size END), 0) / 1024.0 / 1024 / 1024 AS Diff_Gb,
+        -- LOG: suma total del día (NULL si no hay LOG)
+        NULLIF(SUM(CASE WHEN bs.type = 'L' THEN bs.compressed_backup_size END), 0) / 1024.0 / 1024 / 1024 AS Log_Gb
     FROM 
         msdb.dbo.backupset bs
     WHERE 
-        bs.backup_finish_date > DATEADD(MONTH, -3, GETDATE()) -- Analizamos últimos 3 meses para tener buena media
+        bs.backup_finish_date > DATEADD(MONTH, -3, GETDATE())
         AND bs.type IN ('D', 'I', 'L')
     GROUP BY 
         bs.database_name, CAST(bs.backup_finish_date AS DATE)
 ),
 MediasPorBase AS (
-    -- Calculamos las medias y los máximos representativos
+    -- Calculamos las métricas excluyendo días sin actividad de ese tipo
     SELECT 
         database_name,
-        AVG(NULLIF(Full_Gb, 0)) AS Avg_Single_Full_Gb,
+        -- FULL: promedio solo de días con FULL (ignora NULLs)
+        AVG(Full_Gb) AS Avg_Single_Full_Gb,
+        MAX(Full_Gb) AS Max_Single_Full_Gb,
+        -- DIFF: promedio solo de días con DIFF
+        AVG(Diff_Gb) AS Avg_Daily_Diff_Gb,
         MAX(Diff_Gb) AS Max_Daily_Diff_Gb,
-        AVG(NULLIF(Log_Gb, 0)) AS Avg_Daily_Log_Gb
+        -- LOG: promedio LOG
+        AVG(Log_Gb) AS Avg_Daily_Log_Gb,
+        MAX(Log_Gb) AS Max_Daily_Log_Gb
     FROM 
         DailyAggregates
     GROUP BY 
@@ -677,21 +687,59 @@ MediasPorBase AS (
 )
 SELECT 
     database_name,
-    CAST(Avg_Single_Full_GB AS DECIMAL(10,2)) AS avg_single_full_gb,
-    CAST(Avg_Single_Full_GB * 5 AS DECIMAL(10,2)) AS total_retention_full_gb,
-    CAST(Max_Daily_Diff_GB * 14 AS DECIMAL(10,2)) AS total_retention_diff_gb,
-    CAST(Avg_Daily_Log_GB * 30 AS DECIMAL(10,2)) AS total_retention_log_gb,
-    CAST((Avg_Single_Full_GB * 5) + 
-         (Max_Daily_Diff_GB * 14) + 
-         (Avg_Daily_Log_GB * 30) 
-         AS DECIMAL(10,2)) AS total_capacity_required_gb,
-    CAST(((Avg_Single_Full_GB * 5) + (Max_Daily_Diff_GB * 14) + (Avg_Daily_Log_GB * 30)) * 1.20 
+    CAST(Avg_Single_Full_Gb AS DECIMAL(10,2)) AS avg_single_full_gb,
+    CAST(Max_Single_Full_Gb AS DECIMAL(10,2)) AS max_single_full_gb,
+    CAST(Avg_Daily_Diff_Gb AS DECIMAL(10,2)) AS avg_daily_diff_gb,
+    CAST(Max_Daily_Diff_Gb AS DECIMAL(10,2)) AS max_daily_diff_gb,
+    CAST(Avg_Daily_Log_Gb AS DECIMAL(10,2)) AS avg_daily_log_gb,
+    CAST(Max_Daily_Log_Gb AS DECIMAL(10,2)) AS max_daily_log_gb,
+    
+    -- Proyección CONSERVADORA (máximos)
+    CAST(Max_Single_Full_Gb * 4 AS DECIMAL(10,2)) AS retention_full_4w_gb,
+    CAST(Max_Daily_Diff_Gb * 14 AS DECIMAL(10,2)) AS retention_diff_14d_gb,
+    CAST(Max_Daily_Log_Gb * 30 AS DECIMAL(10,2)) AS retention_log_30d_gb,
+    CAST((Max_Single_Full_Gb * 4) + (Max_Daily_Diff_Gb * 14) + (Max_Daily_Log_Gb * 30) 
+         AS DECIMAL(10,2)) AS total_conservative_gb,
+    
+    -- Proyección PROMEDIO (medias reales, sin ceros contaminantes)
+    CAST(Avg_Single_Full_Gb * 4 AS DECIMAL(10,2)) AS retention_full_4w_avg_gb,
+    CAST(Avg_Daily_Diff_Gb * 14 AS DECIMAL(10,2)) AS retention_diff_14d_avg_gb,
+    CAST(Avg_Daily_Log_Gb * 30 AS DECIMAL(10,2)) AS retention_log_30d_avg_gb,
+    CAST((Avg_Single_Full_Gb * 4) + (Avg_Daily_Diff_Gb * 14) + (Avg_Daily_Log_Gb * 30) 
+         AS DECIMAL(10,2)) AS total_average_gb,
+    
+    -- Buffer de crecimiento 20%
+    CAST(((Max_Single_Full_Gb * 4) + (Max_Daily_Diff_Gb * 14) + (Max_Daily_Log_Gb * 30)) * 1.20 
          AS DECIMAL(10,2)) AS projected_with_growth_buffer_gb
+    
 FROM 
     MediasPorBase
 ORDER BY 
-    total_capacity_required_gb DESC;
+    total_conservative_gb DESC;
 ```
+#### Definición de campos del resultado
+
+| Campo | Descripción | 
+|---|---|
+| **Métricas base** |
+| `database_name` | Nombre de la base de datos analizada |
+| `avg_single_full_gb` | Promedio del tamaño máximo diario de FULL (días con FULL únicamente) |
+| `max_single_full_gb` | Máximo histórico del tamaño diario de FULL |
+| `avg_daily_diff_gb` | Promedio diario de acumulación del diferencial (solo días con DIFF) |
+| `max_daily_diff_gb` | Máximo diario de acumulación diferencial |
+| `avg_daily_log_gb` | Promedio diario de generación de logs (solo días con LOG) |
+| `max_daily_log_gb` | Máximo diario de generación de logs |
+| `retention_full_4w_gb` | 4 FULLs semanales al tamaño máximo |
+| `retention_diff_14d_gb` | 14 días de DIFFs al máximo diario |
+| `retention_log_30d_gb` | 30 días de LOGs al máximo diario |
+| `total_conservative_gb` | Suma de retenciones conservadoras |
+| **Proyección PROMEDIO (usando medias)** |
+| `retention_full_4w_avg_gb` | 4 FULLs semanales al tamaño promedio |
+| `retention_diff_14d_avg_gb` | 14 días de DIFFs al promedio diario |
+| `retention_log_30d_avg_gb` | 30 días de LOGs al promedio diario |
+| `total_average_gb` | Suma de retenciones promedio |
+| **Buffer de crecimiento** |
+| `projected_with_growth_buffer_gb` | `total_conservative_gb` + 20% |
 
 ---
 
@@ -801,7 +849,11 @@ WITH
     CHECKSUM,
     STATS = 10;
 ```
-
+> 💡 **Nota sobre `WITH CREDENTIAL`:** En SQL Server 2016 y posteriores, si el nombre 
+> de la credencial coincide exactamente con la URL base del contenedor 
+> (`https://<storage_account>.blob.core.windows.net/<container>`), el motor 
+> detecta y usa la credencial automáticamente sin necesidad de especificar 
+> `WITH CREDENTIAL` en el comando `BACKUP`.
 ---
 
 ### Backup con nombre dinámico por fecha
