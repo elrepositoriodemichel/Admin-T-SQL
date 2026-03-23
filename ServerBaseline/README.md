@@ -301,7 +301,7 @@ ORDER BY
 **Por qué importa:** El almacenamiento es el cuello de botella más común. Las latencias de I/O degradan todas las operaciones, no solo las consultas "lentas".
 ### 2.1 Latencias de I/O por Fichero
 Umbrales de referencia (no dogmas):
-| ms | Valoración| Medio |
+| Tiempo | Valoración| Medio |
 | ---: | --- | --- |
 | < 2 ms | Excelente | NVMe/SSD premium |
 | 2–5 ms | Muy bueno | SSD Estándard |
@@ -356,33 +356,77 @@ ORDER BY
 ### 2.2 Crecimiento de Ficheros y Espacio
 ```sql
 -- Tendencia de crecimiento (comparar con capturas anteriores)
-SELECT 
-    DB_NAME(f.database_id) AS database_name, -- En Azure: DB_NAME()
-    f.name AS logical_name,
-    f.physical_name,
-    f.type_desc,
-    CAST(f.size * 8.0 / 1024 AS DECIMAL(10,2)) AS current_size_mb,
-    CAST(f.max_size * 8.0 / 1024 AS DECIMAL(10,2)) AS max_size_mb,
-    CASE f.is_percent_growth
-        WHEN 1 THEN CAST(f.growth AS VARCHAR) + ' %'
-        ELSE CAST(CAST(f.growth * 8.0 / 1024 AS DECIMAL(10,2)) AS VARCHAR) + ' MB'
-    END AS autogrowth_setting,
-    -- Cálculo de espacio libre interno (solo para ficheros de datos)
-    CAST(ISNULL(FILEPROPERTY(f.name, 'SpaceUsed') * 8.0 / 1024, 0) 
-        AS DECIMAL(10,2)) AS space_used_mb,
-    CAST(ISNULL((f.size - FILEPROPERTY(f.name, 'SpaceUsed')) * 8.0 / 1024, 0) 
-        AS DECIMAL(10,2)) AS free_space_mb,
-    CAST(ISNULL((FILEPROPERTY(f.name, 'SpaceUsed') * 100.0 / f.size), 0) 
-        AS DECIMAL(5,2)) AS percent_used
-FROM 
-    sys.master_files f          -- En Azure: sys.database_files
-WHERE 
-    f.database_id > 4           -- En Azure: DB_ID() > 4
-ORDER BY 
-    f.database_id, f.type_desc; -- En Azure: Omitir f.database_id
+IF OBJECT_ID('tempdb..#FileStats') IS NOT NULL DROP TABLE #FileStats;
 
--- Azure SQL Database: 💡 Sustituir los valores indicados a lo largo de los
--- comentarios de la SELECT.
+CREATE TABLE #FileStats 
+    (
+        database_name NVARCHAR(128),
+        logical_name NVARCHAR(128),
+        physical_name NVARCHAR(260),
+        type_desc NVARCHAR(60),
+        current_size_mb DECIMAL(10,2),
+        max_size_mb DECIMAL(10,2),
+        autogrowth_setting NVARCHAR(50),
+        space_used_mb DECIMAL(10,2),
+        free_space_mb DECIMAL(10,2),
+        percent_used DECIMAL(5,2)
+    );
+
+-- Cursor sobre todas las BBDDs online
+DECLARE @db_name NVARCHAR(128);
+DECLARE @sql     NVARCHAR(MAX);
+
+DECLARE db_cursor CURSOR FAST_FORWARD FOR
+    SELECT name 
+    FROM sys.databases 
+    WHERE state_desc = 'ONLINE'
+    AND database_id > 4;  -- Excluir sistema. Quitar condición si se quiere incluir tempdb, etc.
+
+OPEN db_cursor;
+FETCH NEXT FROM db_cursor INTO @db_name;
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    SET @sql = N'
+        USE ' + QUOTENAME(@db_name) + N';
+        INSERT INTO #FileStats
+            SELECT 
+                DB_NAME() AS database_name,
+                f.name AS logical_name,
+                f.physical_name,
+                f.type_desc,
+                CAST(f.size * 8.0 / 1024 AS DECIMAL(10,2)) AS current_size_mb,
+                CASE 
+                    WHEN f.type_desc = ''LOG'' AND f.max_size = 268435456 THEN NULL
+                    WHEN f.max_size = -1 THEN NULL
+                    WHEN f.max_size = 0 THEN  0
+                    ELSE CAST(f.max_size * 8.0 / 1024 AS DECIMAL(10,2))
+                END AS max_size_mb,
+                CASE f.is_percent_growth
+                    WHEN 1 THEN CAST(f.growth AS VARCHAR) + '' %''
+                    ELSE CAST(CAST(f.growth * 8.0 / 1024 AS DECIMAL(10,2)) AS VARCHAR) + '' MB''
+                END AS autogrowth_setting,
+                CAST(FILEPROPERTY(f.name, ''SpaceUsed'') * 8.0 / 1024 AS DECIMAL(10,2)) AS space_used_mb,
+                CAST((f.size - FILEPROPERTY(f.name, ''SpaceUsed'')) * 8.0 / 1024 AS DECIMAL(10,2)) AS free_space_mb,
+                CAST(FILEPROPERTY(f.name, ''SpaceUsed'') * 100.0 / f.size AS DECIMAL(5,2))  AS percent_used
+            FROM 
+                sys.database_files f;';
+
+    EXEC sp_executesql @sql;
+    FETCH NEXT FROM db_cursor INTO @db_name;
+END;
+
+CLOSE db_cursor;
+DEALLOCATE db_cursor;
+
+SELECT * 
+FROM #FileStats
+ORDER BY 
+    database_name, type_desc;
+
+DROP TABLE #FileStats;
+
+-- Script válido también para Azure SQL Database
 ```
 #### Baseline a capturar:
 - Latencias promedio por fichero de datos críticos
