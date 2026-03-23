@@ -302,7 +302,7 @@ ORDER BY
 ### 2.1 Latencias de I/O por Fichero
 Umbrales de referencia (no dogmas):
 | ms | Valoración| Medio |
-| --- | --- | --- |
+| ---: | --- | --- |
 | < 2 ms | Excelente | NVMe/SSD premium |
 | 2–5 ms | Muy bueno | SSD Estándard |
 | 6–15 ms | Bueno | HDDs RAID |
