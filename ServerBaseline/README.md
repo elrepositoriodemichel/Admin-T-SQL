@@ -246,13 +246,21 @@ SELECT TOP 20
     ws.wait_time_ms - ws.signal_wait_time_ms AS resource_wait_ms,
     -- Clasificación útil para análisis
     CASE 
+        -- Capa de almacenamiento (Disco)
         WHEN ws.wait_type LIKE 'PAGEIOLATCH%' THEN 'Storage I/O'
+        WHEN ws.wait_type LIKE 'WRITELOG%' THEN 'Transaction Log I/O'
+        WHEN ws.wait_type LIKE 'BACKUP%' THEN 'Backup/Restore'
+        -- Capa de memoria (Buffer Pool)
         WHEN ws.wait_type LIKE 'PAGELATCH%' THEN 'Buffer/memory'
+        -- Capa de concurrencia (Bloqueos)
         WHEN ws.wait_type LIKE 'LCK%' THEN 'Locking'
+        -- Capa de procesamiento (CPU)
         WHEN ws.wait_type LIKE 'SOS_SCHEDULER%' THEN 'CPU/Scheduler'
         WHEN ws.wait_type LIKE 'CXPACKET%' OR ws.wait_type LIKE 'CXCONSUMER%' THEN 'Parallelism'
+        -- Capara de red/comunicación
         WHEN ws.wait_type LIKE 'ASYNC_NETWORK_IO%' THEN 'Network/Client'
-        WHEN ws.wait_type LIKE 'WRITELOG%' THEN 'Transaction Log I/O'
+        WHEN ws.wait_type LIKE 'HADR%' THEN 'Availability Groups'
+        WHEN ws.wait_type LIKE 'OLEDB%' THEN 'Linked Servers'
         ELSE 'Other'
     END AS wait_category
 FROM 
@@ -292,6 +300,47 @@ ORDER BY
 ```
 
 > 💡 Una de las mejores referencia de los tipos de esperas podrás encontrarla en [SQLSkills](https://www.sqlskills.com/help/waits)
+
+#### Desglose de la clasificación para el análisis:
+1 - **Storage I/O** (`PAGEIOLATCH%`)
+- **Se da cuando:** una query necesita una página de datos que no está en el buffer pool y hay que leerla del disco. SQL Server pide la lectura al SO y espera a que llegue. Es espera física de I/O. Si es alto: el buffer pool es insuficiente para la carga de trabajo o el almacenamiento es lento.
+- **Causa común:** Discos lentos (IOPS insuficientes para la carga de trabajo), falta de Memoria RAM (que obliga a leer más en disco) o consultas que leen tablas gigantescas sin utilizar índices.
+
+2 - **Buffer/Memory** (`PAGELATCH%`)
+- **Se da cuando:** la página ya está en el buffer pool (no hay I/O de disco) pero otra sesión la está modificando en ese momento. Es contención en memoria entre sesiones concurrentes. Típico en `tempdb` con mucha concurrencia o en tablas muy calientes. El problema es CPU/memoria, no disco.
+- **Causa común:** tablas con muchísimas inserciones simultáneas en una misma página (frecuente en índices con claves secuenciales), contención en `tempdb`, contenciones en las páginas PFS (Page Free Space), GAM (Global Allocation Map) y SGAM (Shared Global Allocation Map).
+
+3 - **Locking** (`LCK%`)
+- **Se da cuando:** una sesión espera porque otra tiene un lock incompatible sobre un recurso (fila, página, tabla). La sesión A quiere leer/escribir algo que la sesión B tiene bloqueado. 
+- **Causa común:** Transacciones que tardan demasiado tiempo abiertas o falta de índices que hace que se bloqueen tablas enteras en lugar de una sola página o fila.
+
+4 - **CPU/Scheduler** (`SOS_SCHEDULER_YIELD`)
+- **Se da cuando:** un worker tiene trabajo listo para ejecutar pero no hay un scheduler de CPU disponible para asignárselo. Indica presión de CPU — más tareas ejecutables que núcleos disponibles. Si es alto: CPU saturada o configuración de `MAXDOP` inadecuada.
+- **Causa común:** consultas muy pesadas matemáticamente, exceso de carga de trabajo o simplemente que el servidor se quedó corto de procesadores (CPU).
+
+5 - **Parallelism** (`CXPACKET` / `CXCONSUMER`)
+- **Se da cuando:** una query se ejecuta en múltiples threads en paralelo y los threads no terminan al mismo tiempo. `CXPACKET` es el productor esperando al consumidor, `CXCONSUMER` el inverso. No siempre es un problema — el paralelismo es normal. Sí es problema si aparece con queries cortas o OLTP donde el paralelismo es contraproducente.
+- **Causa común:** configuración de `MAXDOP` inadecuada o consultas que el optimizador cree que son pesadas pero están mal diseñadas o utiliza estadísticas incorrectas.
+
+6 - **Network/Client** (`ASYNC_NETWORK_IO`)
+- **Se da cuando:** SQL Server terminó de procesar y tiene resultados listos, pero el cliente no los está consumiendo tan rápido como se generan. No tiene por qué ser un problema de red en sí — puede ser debido a que el cliente procesa fila a fila en lugar de en bulk, o la red tiene latencia. Típico en aplicaciones que iteran resultados lentamente.
+- **Causa común:** no es problema de SQL Server, es de la red  (latencia alta, ancho de banda limitado), la aplicación que consume los datos (procesando datos fila por fila a través de cursores) o `Result sets` enormes enviados a la aplicación.
+
+7 - **Transaction Log I/O** (`WRITELOG`)
+- **Se da cuando:** una transacción ha hecho COMMIT y espera a que el Log Manager escriba físicamente al fichero de log antes de confirmar. Es la garantía de durabilidad (la D de ACID). Si es alto: el disco del log es lento, el log está en el mismo disco que los datos, o hay transacciones muy frecuentes y pequeñas que podrían agruparse.
+- **Causa común:** el log en disco esta compartido (mismo disco que datos) o es muy lento, hay transacciones muy frecuentes y pequeñas en lugar de procesos que gestionen la información por lotes.
+
+8 - **Availability Groups** (`HADR%`)
+- **Se da cuando:** SQL Server está esperando sincronización con réplicas de Availability Groups (AG). Por ejemplo HADR_SYNC_COMMIT indica que una transacción en el primario está esperando confirmación de que el log ha sido endurecido en el secundario antes de confirmar el commit — esto ocurre en modo síncrono. 
+- **Causa común:** Latencia de red entre nodos del cluster, secundario sobrecargado, o que el modo síncrono está penalizando el rendimiento del primario.
+
+9 - **Backup/Restore** (`BACKUP%`)
+- **Se da cuando:** generados durante operaciones de backup y restore. `BACKUPBUFFER` indica que el proceso de backup está esperando que se llene el buffer antes de escribirlo al destino, y `BACKUPIO` que está esperando a la escritura física en el medio de backup.
+- **Causa común:** al crear un backup o leerse desde una unidad lenta o si existe latencia red, coindidencia con horas pico de tráfico de red, volumenes de backup compartidos con los de datos.
+
+10 - **Linked Servers** (`OLEDB%`)
+- **Se da cuando:** aparecen cuando una query cruza un linked server — SQL Server lanza la petición al servidor remoto y espera la respuesta.
+- **Causa común:** queries distribuidas lentas, linked servers a servidores sobrecargados o con alta latencia de red, o uso excesivo de linked servers donde debería haber una integración más directa.
 
 #### Baseline a capturar:
 - Top 5 waits por tiempo acumulado en condiciones normales
