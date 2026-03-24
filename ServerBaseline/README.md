@@ -395,19 +395,19 @@ BEGIN
                 f.name AS logical_name,
                 f.physical_name,
                 f.type_desc,
-                CAST(f.size * 8.0 / 1024 AS DECIMAL(10,2)) AS current_size_mb,
+                CAST(f.size / 128.0 AS DECIMAL(10,2)) AS current_size_mb,
                 CASE 
                     WHEN f.type_desc = ''LOG'' AND f.max_size = 268435456 THEN NULL
                     WHEN f.max_size = -1 THEN NULL
                     WHEN f.max_size = 0 THEN  0
-                    ELSE CAST(f.max_size * 8.0 / 1024 AS DECIMAL(10,2))
+                    ELSE CAST(f.max_size / 128.0  AS DECIMAL(10,2))
                 END AS max_size_mb,
                 CASE f.is_percent_growth
                     WHEN 1 THEN CAST(f.growth AS VARCHAR) + '' %''
-                    ELSE CAST(CAST(f.growth * 8.0 / 1024 AS DECIMAL(10,2)) AS VARCHAR) + '' MB''
+                    ELSE CAST(CAST(f.growth / 128.0  AS DECIMAL(10,2)) AS VARCHAR) + '' MB''
                 END AS autogrowth_setting,
-                CAST(FILEPROPERTY(f.name, ''SpaceUsed'') * 8.0 / 1024 AS DECIMAL(10,2)) AS space_used_mb,
-                CAST((f.size - FILEPROPERTY(f.name, ''SpaceUsed'')) * 8.0 / 1024 AS DECIMAL(10,2)) AS free_space_mb,
+                CAST(FILEPROPERTY(f.name, ''SpaceUsed'') / 128.0 AS DECIMAL(10,2)) AS space_used_mb,
+                CAST((f.size - FILEPROPERTY(f.name, ''SpaceUsed'')) / 128.0 AS DECIMAL(10,2)) AS free_space_mb,
                 CAST(FILEPROPERTY(f.name, ''SpaceUsed'') * 100.0 / f.size AS DECIMAL(5,2))  AS percent_used
             FROM 
                 sys.database_files f;';
