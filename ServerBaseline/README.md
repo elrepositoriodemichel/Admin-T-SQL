@@ -219,7 +219,7 @@ ORDER BY
 
 
 | NUMA Node | Buffer Pool (Pages) | Buffer Pool (GB) | Suggested Threshold | Current PLE |
-| --- | --- | --- | --- | --- |
+|---|---|---|---|---|
 | 0 | 577.880 | 4,43 | 3.632 | 5.436 |
 | 1 | 547.127 | 4,98 | 3.899 | 6.215 |
 
@@ -332,7 +332,7 @@ ORDER BY
 
 8 - **Availability Groups** (`HADR%`)
 - **Se da cuando:** SQL Server está esperando sincronización con réplicas de Availability Groups (AG). Por ejemplo HADR_SYNC_COMMIT indica que una transacción en el primario está esperando confirmación de que el log ha sido endurecido en el secundario antes de confirmar el commit — esto ocurre en modo síncrono. 
-- **Causa común:** Latencia de red entre nodos del cluster, secundario sobrecargado, o que el modo síncrono está penalizando el rendimiento del primario.
+- **Causa común:** Latencia de red entre nodos del cluster, secundario sobrecargado, o que el modo síncrono está penalizando el rendimiento del primario.<br>*Nota:* Existen más de 60 tipos de espera que inician con `HADR%` de las cuales solo estamos excluyendo unas pocas, por lo que habría que hacer la valoración correspondiente en base el tipo en concreto que encontremos.
 
 9 - **Backup/Restore** (`BACKUP%`)
 - **Se da cuando:** generados durante operaciones de backup y restore. `BACKUPBUFFER` indica que el proceso de backup está esperando que se llene el buffer antes de escribirlo al destino, y `BACKUPIO` que está esperando a la escritura física en el medio de backup.
@@ -482,205 +482,11 @@ DROP TABLE #FileStats;
 - Tasa de crecimiento semanal de las principales bases de datos
 - Número de autogrowths por día (ideal: 0, todos los crecimientos deben ser manuales planificados)
 
-## 3 · Mantenimiento y Salud de Objetos
-
-**Por qué importa:** Índices fragmentados y estadísticas desactualizadas generan planes de ejecución subóptimos, consumiendo más recursos de los necesarios.
-
-### 3.1 Fragmentación de Índices
-
-> 📝 **Fragmentación externa** (páginas desordenadas físicamente) impacta 
-> operaciones que requieren lectura secuencial de rangos de datos. 
-> **Fragmentación interna** (páginas semivacías) aumenta el número de páginas 
-> necesarias para almacenar los mismos datos, afectando el rendimiento de 
-> acceso general. Ver [Reorganize and Rebuild Indexes](https://learn.microsoft.com/en-us/sql/relational-databases/indexes/reorganize-and-rebuild-indexes).
-
-```sql
--- Fragmentación de índices con volumen significativo
--- Ejecutar en cada base de datos de interés
-SELECT 
-    DB_NAME() AS database_name,
-    SCHEMA_NAME(t.schema_id) AS schema_name,
-    t.name AS table_name,
-    i.name AS index_name,
-    i.type_desc AS index_type,
-    ips.index_type_desc AS alloc_unit_type,
-    ips.avg_fragmentation_in_percent,
-    ips.page_count,
-    ips.record_count,
-    -- Recomendación de acción basada en fragmentación
-    CASE 
-        WHEN ips.avg_fragmentation_in_percent < 5 THEN 'OK'
-        WHEN ips.avg_fragmentation_in_percent < 30 THEN 'REORGANIZE'
-        ELSE 'REBUILD'
-    END AS suggested_action,
-    -- Solo relevante para reorganizar/rebuild si tiene volumen
-    CASE WHEN ips.page_count > 1000 THEN 'Significant volume'
-         ELSE 'Low volume - consider if worth action'
-    END AS volume_assessment
-FROM 
-    sys.dm_db_index_physical_stats(DB_ID(), NULL, NULL, NULL, 'LIMITED') ips
-        INNER JOIN 
-    sys.tables t ON ips.object_id = t.object_id
-        INNER JOIN 
-    sys.indexes i ON ips.object_id = i.object_id AND ips.index_id = i.index_id
-WHERE 
-    ips.page_count > 1000                       -- Ignorar índices pequeños (< 8 MB aprox)
-    AND ips.avg_fragmentation_in_percent > 10   -- Solo problemáticos
-    AND i.type > 0                              -- Excluir heaps (type = 0)
-ORDER BY 
-    ips.avg_fragmentation_in_percent DESC;
-```
-
-## 3.2 Estadísticas Desactualizadas
-
-```sql
--- Estadísticas con más de 7 días sin actualizar
--- o con modificaciones significativas desde última actualización
-SELECT 
-    DB_NAME() AS database_name,
-    SCHEMA_NAME(t.schema_id) AS schema_name,
-    t.name AS table_name,
-    s.name AS stats_name,
-    s.auto_created,
-    s.user_created,
-    sp.last_updated,
-    sp.rows,
-    sp.rows_sampled,
-    sp.modification_counter,
-    -- Porcentaje de cambios desde última actualización
-    CASE WHEN sp.rows > 0 
-         THEN CAST(sp.modification_counter * 100.0 / sp.rows AS DECIMAL(5,2))
-         ELSE 0 
-    END AS percent_modified,
-    -- Actualizar si > 10% de cambios o > 7 días
-    CASE 
-        WHEN sp.modification_counter > sp.rows * 0.1 THEN 'UPDATE (10% changes)'
-        WHEN sp.last_updated < DATEADD(DAY, -7, GETDATE()) THEN 'UPDATE (stale)'
-        ELSE 'OK'
-    END AS status
-FROM 
-    sys.stats s
-        INNER JOIN 
-    sys.tables t ON s.object_id = t.object_id
-        CROSS APPLY 
-    sys.dm_db_stats_properties(s.object_id, s.stats_id) sp
-WHERE 
-    s.auto_created = 0      -- Ignorar estadísticas auto (se actualizan automáticamente)
-    OR s.user_created = 1   -- Incluir creadas por usuarios
-ORDER BY 
-    percent_modified DESC;
-```
-## 3.3 Índices: Uso y Sugerencias (con Advertencias)
-
->⚠️ Missing indexes: Son sugerencias del optimizador, no mandatos. Antes de crear:
->- ¿La query se ejecuta frecuentemente? (impacto)
->- ¿El costo de mantenimiento del índice supera el beneficio? (tablas muy volátiles)
->- ¿Ya existe un índice similar que podría ajustarse?
-
-```sql
--- Missing indexes: impacto estimado ordenado
-SELECT TOP 20
-    DB_NAME(mid.database_id) AS database_name,
-    OBJECT_NAME(mid.object_id, mid.database_id) AS table_name,
-    -- Impacto estimado (user benefit)
-    migs.avg_user_impact,
-    migs.user_seeks + migs.user_scans AS estimated_uses,
-    -- Columnas sugeridas
-    mid.equality_columns,
-    mid.inequality_columns,
-    mid.included_columns,
-    -- Cálculo de "peso" de la sugerencia
-    migs.avg_user_impact * (migs.user_seeks + migs.user_scans) / 100.0 AS weight_score,
-    -- Script de creación tentativo (revisar siempre antes de ejecutar)
-    'CREATE INDEX [IX_' + LEFT(OBJECT_NAME(mid.object_id, mid.database_id) + '__' 
-        + REPLACE(REPLACE(REPLACE(ISNULL(mid.equality_columns, '') 
-                                + ISNULL(mid.inequality_columns, ''), '[', ''), ']', ''), ', ', '__'), 125) + '] ON ' 
-       + mid.statement + ' (' + ISNULL(mid.equality_columns, '') 
-       + CASE 
-            WHEN mid.equality_columns IS NOT NULL AND mid.inequality_columns IS NOT NULL THEN ', ' 
-            ELSE '' END 
-       + ISNULL(mid.inequality_columns, '') + ')' 
-       + CASE 
-            WHEN mid.included_columns IS NOT NULL THEN ' INCLUDE (' + mid.included_columns + ')' 
-            ELSE '' END 
-       + ';' AS tentative_ddl,
-    st.text,
-    qp.query_plan
-FROM 
-    sys.dm_db_missing_index_details mid
-        INNER JOIN 
-    sys.dm_db_missing_index_groups mig ON mid.index_handle = mig.index_handle
-        INNER JOIN 
-    sys.dm_db_missing_index_group_stats migs ON mig.index_group_handle = migs.group_handle
-        INNER JOIN
-    -- Requiere SQL Server 2019+
-    sys.dm_db_missing_index_group_stats_query migsq ON mig.index_group_handle = migsq.group_handle
-        OUTER APPLY 
-            (
-                SELECT TOP 1 plan_handle 
-                FROM sys.dm_exec_query_stats qs 
-                WHERE qs.query_plan_hash = migsq.query_plan_hash AND qs.plan_handle IS NOT NULL
-                ORDER BY qs.execution_count DESC
-            ) qs
-        OUTER APPLY 
-    sys.dm_exec_sql_text(migsq.last_sql_handle) st
-        OUTER APPLY
-    sys.dm_exec_query_plan(qs.plan_handle) qp
-ORDER BY 
-    weight_score DESC;
-
--- Índices no utilizados (candidatos a eliminar, con cautela)
--- IMPORTANTE: Los contadores se reinician al arrancar SQL Server. 
--- No eliminar índices basándose solo en esta query sin histórico.
--- Evaluar primero cuándo se reinició SQL Server
---    SELECT sqlserver_start_time FROM sys.dm_os_sys_info;
-
-WITH index_physical_stats AS
-    (   -- Tamaño del índice para contexto
-        SELECT 
-            object_id, 
-            index_id, 
-            page_count, 
-            avg_fragmentation_in_percent
-        FROM 
-            sys.dm_db_index_physical_stats(DB_ID(), NULL, NULL, NULL, 'LIMITED')
-        WHERE
-            page_count > 0
-    )
-SELECT 
-    DB_NAME() AS database_name,
-    SCHEMA_NAME(t.schema_id) AS schema_name,
-    t.name AS table_name,
-    i.name AS index_name,
-    i.type_desc,
-    -- Información adicional útil
-    ps.page_count,
-    CAST(ps.avg_fragmentation_in_percent AS DECIMAL(5,2)) AS fragmentation_pct
-FROM 
-    sys.tables t 
-        INNER JOIN 
-    sys.indexes i ON i.object_id = t.object_id
-        LEFT JOIN 
-    index_physical_stats ps ON i.object_id = ps.object_id AND i.index_id = ps.index_id
-        LEFT JOIN 
-    sys.dm_db_index_usage_stats ius ON i.object_id = ius.object_id 
-                                   AND i.index_id = ius.index_id
-WHERE 
-    i.type_desc <> 'HEAP'
-    AND i.is_primary_key = 0
-    AND i.is_unique = 0
-    AND i.is_unique_constraint = 0
-    AND ISNULL(ius.user_seeks, 0) + ISNULL(ius.user_scans, 0) + ISNULL(ius.user_lookups, 0) = 0
-ORDER BY 
-    -- Priorizar índices grandes que ocupan espacio
-    ps.page_count DESC; 
-```
-
-## 4 · Operaciones Programadas
+## 3 · Operaciones Programadas
 
 **Por qué importa:** Los jobs de mantenimiento son la salud preventiva de la instancia. Un job que falla silenciosamente es una bomba de tiempo.
 
-### 4.1 Estado de SQL Agent Jobs
+### 3.1 Estado de SQL Agent Jobs
 ```sql
 -- Última ejecución y estado de todos los jobs
 SELECT 
@@ -724,7 +530,7 @@ WHERE jh.run_status = 0  -- Failed
 ORDER BY failed_datetime DESC;
 ```
 
-### 4.2 Cadenas de Backup Completas
+### 3.2 Cadenas de Backup Completas
 
 ```sql
 -- Últimos backups por base de datos y tipo
@@ -758,7 +564,7 @@ ORDER BY bs.database_name,
 -- Azure SQL Database: usar sys.dm_database_backups (limitado) o Azure Portal/Monitor
 ```
 
-### 4.3 Integridad de Datos (CHECKDB)
+### 3.3 Integridad de Datos (CHECKDB)
 
 ```sql
 -- Último CHECKDB exitoso por base de datos
@@ -781,11 +587,11 @@ ORDER BY days_since_checkdb DESC;
 -- Usar DBCC CHECKDB manual solo en Managed Instance o IaaS.
 ```
 
-## 5 · Alta Disponibilidad y Sincronización
+## 4 · Alta Disponibilidad y Sincronización
 
 **Por qué importa:** El lag de replicación determina tu RPO (Recovery Point Objective) real en caso de failover.
 
-### 5.1 Always On Availability Groups (On-prem/MI)
+### 4.1 Always On Availability Groups (On-prem/MI)
 
 ``` sql
 -- Estado de sincronización y lag de redo
@@ -823,7 +629,7 @@ FROM sys.availability_groups ag
 JOIN sys.dm_hadr_availability_group_states ags ON ag.group_id = ags.group_id;
 ```
 
-### 5.2 Azure SQL: Failover Groups y Geo-replicación
+### 4.2 Azure SQL: Failover Groups y Geo-replicación
 > 📋 En Azure SQL Database (PaaS), usar Azure Portal, CLI o PowerShell para estado de failover groups. Las DMVs anteriores no aplican.
 
 ```powershell
@@ -845,9 +651,9 @@ az sql db replica list-links
 - Tiempo de failover histórico (si se han hecho drills)
 - Estado de routing (primaria vs. secundaria legible)
 
-## 6 · Herramientas y Automatización
+## 5 · Herramientas y Automatización
 
-### 6.1 sp_WhoIsActive (Adam Machanic)
+### 5.1 sp_WhoIsActive (Adam Machanic)
 
 Procedimiento almacenado de diagnóstico en tiempo real. Capturar periódicamente en tabla para análisis histórico:
 
@@ -877,7 +683,7 @@ EXEC sp_WhoIsActive
     @destination_table = 'dbo.WhoIsActiveLog';
 ```
 
-### 6.2 First Responder Kit (Brent Ozar Unlimited)
+### 5.2 First Responder Kit (Brent Ozar Unlimited)
 
 Scripts de emergencia y diagnóstico que complementan esta baseline:
 
@@ -889,7 +695,7 @@ Scripts de emergencia y diagnóstico que complementan esta baseline:
 | `sp_BlitzIndex` | Análisis completo de índices |
 | `sp_BlitzWho` | Actividad actual (alternativa a WhoIsActive) |
 
-## 6.3 Azure Monitor y Log Analytics (Azure SQL)
+## 5.3 Azure Monitor y Log Analytics (Azure SQL)
 Para Azure SQL Database y Managed Instance, configurar:
 - Diagnostic settings → Log Analytics
 - Metrics: CPU %, Data IO %, Log IO %, storage %
